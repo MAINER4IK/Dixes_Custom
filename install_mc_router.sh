@@ -6,10 +6,14 @@
 MC_ROUTER_IMAGE="itzg/mc-router:latest"
 FRP_VERSION="0.60.0"
 FRP_PORT="7000"
+PUBLIC_IP="31.25.235.168"
+DOMAIN="local.xneon.org"
+FRP_TOKEN="momp pop009004"
 INSTALL_DIR="/opt/mc-router-frp"
 COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
 ENV_FILE="$INSTALL_DIR/.env"
 SYSTEMD_SERVICE="/etc/systemd/system/mc-router-frp.service"
+API_PORT="8080"
 
 # Function to check if a command exists
 command_exists() {
@@ -21,8 +25,9 @@ resolve_containerd_conflict() {
     echo "Checking for containerd conflicts..."
     if dpkg -l | grep -q containerd; then
         echo "Removing conflicting containerd package..."
-        sudo apt-get remove --purge -y containerd
+        sudo apt-get remove --purge -y containerd containerd.io docker.io
         sudo apt-get autoremove -y
+        sudo apt-get autoclean
     fi
 }
 
@@ -32,11 +37,15 @@ check_docker() {
         echo "Docker not found. Installing Docker..."
         sudo apt-get update
         resolve_containerd_conflict
-        sudo apt-get install -y docker.io
+        sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu jammy stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+        sudo apt-get update
+        sudo apt-get install -y docker-ce docker-ce-cli containerd.io
         if [ $? -ne 0 ]; then
             echo "Failed to install Docker. Trying to fix dependencies..."
             sudo apt-get install -f
-            sudo apt-get install -y docker.io
+            sudo apt-get install -y docker-ce docker-ce-cli containerd.io
         fi
         sudo systemctl enable docker
         sudo systemctl start docker
@@ -60,6 +69,15 @@ check_docker_compose() {
     fi
 }
 
+# Function to configure firewall
+configure_firewall() {
+    echo "Configuring firewall to allow ports 5000-6000, $FRP_PORT, and $API_PORT..."
+    sudo ufw allow 5000:6000/tcp
+    sudo ufw allow $FRP_PORT/tcp
+    sudo ufw allow $API_PORT/tcp
+    sudo ufw status
+}
+
 # Function to install mc-router and frp
 install_mc_router_frp() {
     echo "Installing mc-router and frp..."
@@ -67,6 +85,7 @@ install_mc_router_frp() {
     # Check prerequisites
     check_docker
     check_docker_compose
+    configure_firewall
 
     # Create installation directory
     sudo mkdir -p "$INSTALL_DIR"
@@ -77,7 +96,10 @@ install_mc_router_frp() {
 MC_ROUTER_IMAGE=$MC_ROUTER_IMAGE
 FRP_VERSION=$FRP_VERSION
 FRP_PORT=$FRP_PORT
-ROUTER_MAPPING=example.com=frp:25566,sub.example.com=frp:25567
+API_PORT=$API_PORT
+DOMAIN=$DOMAIN
+PUBLIC_IP=$PUBLIC_IP
+FRP_TOKEN=$FRP_TOKEN
 EOL
 
     # Create docker-compose.yml
@@ -90,6 +112,7 @@ services:
     image: snowdreamtech/frps:\${FRP_VERSION}
     ports:
       - "\${FRP_PORT}:\${FRP_PORT}"
+      - "5000-6000:5000-6000"
     volumes:
       - $INSTALL_DIR/frps.ini:/etc/frp/frps.ini
     restart: unless-stopped
@@ -98,9 +121,11 @@ services:
     depends_on:
       - frps
     ports:
-      - "25565:25565"
+      - "5000-6000:5000-6000"
+      - "\${API_PORT}:\${API_PORT}"
     environment:
-      MAPPING: \${ROUTER_MAPPING}
+      API_BINDING: 0.0.0.0:\${API_PORT}
+      SIMPLIFY_SRV: "true"
     restart: unless-stopped
 EOL
 
@@ -108,9 +133,10 @@ EOL
     echo "Creating frps.ini at $INSTALL_DIR/frps.ini..."
     sudo bash -c "cat > $INSTALL_DIR/frps.ini" << EOL
 [common]
+bind_addr = 0.0.0.0
 bind_port = $FRP_PORT
-# Optional: Uncomment and set a token for security
-# token = your_secure_token
+token = $FRP_TOKEN
+allow_ports = 5000-6000
 EOL
 
     # Create systemd service
@@ -148,10 +174,11 @@ EOL
     # Verify service status
     if sudo systemctl is-active --quiet mc-router-frp.service; then
         echo "Installation complete!"
-        echo "mc-router is exposed on port 25565."
-        echo "frps is exposed on port $FRP_PORT."
-        echo "Edit $ENV_FILE to customize ROUTER_MAPPING for your domains."
-        echo "Edit $INSTALL_DIR/frps.ini to configure frp settings (e.g., add a token)."
+        echo "mc-router is exposed on ports 5000-6000 for $DOMAIN ($PUBLIC_IP)."
+        echo "frps is exposed on port $FRP_PORT for client connections."
+        echo "REST API is available on port $API_PORT."
+        echo "Edit $ENV_FILE to customize DOMAIN or other settings."
+        echo "Edit $INSTALL_DIR/frps.ini to update the token or port range."
         echo "Manage the service with: sudo systemctl {start|stop|restart|status} mc-router-frp.service"
     else
         echo "Error: Service failed to start. Check logs with:"
