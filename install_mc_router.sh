@@ -1,34 +1,61 @@
 #!/bin/bash
 
-# Minecraft mc-router and frp installation/removal script for Ubuntu
+# Minecraft mc-router and frp installation/uninstallation script for Ubuntu with systemd
 
 # Default variables
 MC_ROUTER_IMAGE="itzg/mc-router:latest"
 FRP_VERSION="0.60.0"
 FRP_PORT="7000"
-COMPOSE_FILE="/tmp/docker-compose.yml"
 INSTALL_DIR="/opt/mc-router-frp"
+COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
 ENV_FILE="$INSTALL_DIR/.env"
+SYSTEMD_SERVICE="/etc/systemd/system/mc-router-frp.service"
 
-# Function to check if Docker is installed
-check_docker() {
-    if ! command -v docker &> /dev/null; then
-        echo "Docker not found. Installing Docker..."
-        sudo apt-get update
-        sudo apt-get install -y docker.io
-        sudo systemctl enable docker
-        sudo systemctl start docker
-        sudo usermod -aG docker $USER
-        echo "Docker installed. You may need to log out and log back in for Docker permissions to take effect."
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" &> /dev/null
+}
+
+# Function to resolve containerd conflicts
+resolve_containerd_conflict() {
+    echo "Checking for containerd conflicts..."
+    if dpkg -l | grep -q containerd; then
+        echo "Removing conflicting containerd package..."
+        sudo apt-get remove --purge -y containerd
+        sudo apt-get autoremove -y
     fi
 }
 
-# Function to check if Docker Compose is installed
+# Function to check and install Docker
+check_docker() {
+    if ! command_exists docker; then
+        echo "Docker not found. Installing Docker..."
+        sudo apt-get update
+        resolve_containerd_conflict
+        sudo apt-get install -y docker.io
+        if [ $? -ne 0 ]; then
+            echo "Failed to install Docker. Trying to fix dependencies..."
+            sudo apt-get install -f
+            sudo apt-get install -y docker.io
+        fi
+        sudo systemctl enable docker
+        sudo systemctl start docker
+        sudo usermod -aG docker "$USER"
+        echo "Docker installed. You may need to log out and log back in for Docker permissions."
+    fi
+}
+
+# Function to check and install Docker Compose
 check_docker_compose() {
-    if ! command -v docker-compose &> /dev/null; then
+    if ! command_exists docker-compose; then
         echo "Docker Compose not found. Installing Docker Compose..."
         sudo apt-get update
         sudo apt-get install -y docker-compose
+        if [ $? -ne 0 ]; then
+            echo "Failed to install Docker Compose. Trying to fix dependencies..."
+            sudo apt-get install -f
+            sudo apt-get install -y docker-compose
+        fi
         echo "Docker Compose installed."
     fi
 }
@@ -37,8 +64,12 @@ check_docker_compose() {
 install_mc_router_frp() {
     echo "Installing mc-router and frp..."
 
+    # Check prerequisites
+    check_docker
+    check_docker_compose
+
     # Create installation directory
-    sudo mkdir -p $INSTALL_DIR
+    sudo mkdir -p "$INSTALL_DIR"
 
     # Create .env file
     echo "Creating .env file at $ENV_FILE..."
@@ -78,64 +109,98 @@ EOL
     sudo bash -c "cat > $INSTALL_DIR/frps.ini" << EOL
 [common]
 bind_port = $FRP_PORT
+# Optional: Uncomment and set a token for security
+# token = your_secure_token
 EOL
 
-    # Ensure permissions
-    sudo chown -R $USER:$USER $INSTALL_DIR
-    sudo chmod 600 $ENV_FILE
-    sudo chmod 644 $INSTALL_DIR/frps.ini
-    sudo chmod 644 $COMPOSE_FILE
+    # Create systemd service
+    echo "Creating systemd service at $SYSTEMD_SERVICE..."
+    sudo bash -c "cat > $SYSTEMD_SERVICE" << EOL
+[Unit]
+Description=Minecraft mc-router and frp service
+After=docker.service
+Requires=docker.service
 
-    # Start Docker Compose services
+[Service]
+Type=simple
+ExecStart=/usr/bin/docker-compose -f $COMPOSE_FILE up
+ExecStop=/usr/bin/docker-compose -f $COMPOSE_FILE down
+Restart=always
+WorkingDirectory=$INSTALL_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+    # Set permissions
+    sudo chown -R "$USER:$USER" "$INSTALL_DIR"
+    sudo chmod 600 "$ENV_FILE"
+    sudo chmod 644 "$INSTALL_DIR/frps.ini"
+    sudo chmod 644 "$COMPOSE_FILE"
+    sudo chmod 644 "$SYSTEMD_SERVICE"
+
+    # Reload systemd and start service
     echo "Starting mc-router and frp services..."
-    docker-compose -f $COMPOSE_FILE up -d
+    sudo systemctl daemon-reload
+    sudo systemctl enable mc-router-frp.service
+    sudo systemctl start mc-router-frp.service
 
-    echo "Installation complete!"
-    echo "mc-router is exposed on port 25565."
-    echo "frps is exposed on port $FRP_PORT."
-    echo "Edit $ENV_FILE to customize ROUTER_MAPPING for your domains."
-    echo "Edit $INSTALL_DIR/frps.ini to configure frp settings."
+    # Verify service status
+    if sudo systemctl is-active --quiet mc-router-frp.service; then
+        echo "Installation complete!"
+        echo "mc-router is exposed on port 25565."
+        echo "frps is exposed on port $FRP_PORT."
+        echo "Edit $ENV_FILE to customize ROUTER_MAPPING for your domains."
+        echo "Edit $INSTALL_DIR/frps.ini to configure frp settings (e.g., add a token)."
+        echo "Manage the service with: sudo systemctl {start|stop|restart|status} mc-router-frp.service"
+    else
+        echo "Error: Service failed to start. Check logs with:"
+        echo "sudo systemctl status mc-router-frp.service"
+        echo "docker-compose -f $COMPOSE_FILE logs"
+        exit 1
+    fi
 }
 
-# Function to remove mc-router and frp
-remove_mc_router_frp() {
-    echo "Removing mc-router and frp..."
+# Function to uninstall mc-router and frp
+uninstall_mc_router_frp() {
+    echo "Uninstalling mc-router and frp..."
+
+    # Stop and disable systemd service
+    if [ -f "$SYSTEMD_SERVICE" ]; then
+        echo "Stopping and disabling systemd service..."
+        sudo systemctl stop mc-router-frp.service
+        sudo systemctl disable mc-router-frp.service
+        sudo rm -f "$SYSTEMD_SERVICE"
+        sudo systemctl daemon-reload
+    fi
 
     # Stop and remove Docker Compose services
-    if [ -f $COMPOSE_FILE ]; then
+    if [ -f "$COMPOSE_FILE" ]; then
         echo "Stopping and removing Docker Compose services..."
-        docker-compose -f $COMPOSE_FILE down
+        docker-compose -f "$COMPOSE_FILE" down
     fi
 
     # Remove installation directory
-    if [ -d $INSTALL_DIR ]; then
+    if [ -d "$INSTALL_DIR" ]; then
         echo "Removing installation directory $INSTALL_DIR..."
-        sudo rm -rf $INSTALL_DIR
+        sudo rm -rf "$INSTALL_DIR"
     fi
 
-    # Remove docker-compose.yml
-    if [ -f $COMPOSE_FILE ]; then
-        echo "Removing docker-compose.yml..."
-        sudo rm -f $COMPOSE_FILE
-    fi
-
-    echo "Removal complete!"
+    echo "Uninstallation complete!"
 }
 
 # CLI interface
 case "$1" in
     install)
-        check_docker
-        check_docker_compose
         install_mc_router_frp
         ;;
-    remove)
-        remove_mc_router_frp
+    uninstall)
+        uninstall_mc_router_frp
         ;;
     *)
-        echo "Usage: $0 {install|remove}"
-        echo "  install: Install mc-router and frp with Docker Compose"
-        echo "  remove: Remove mc-router, frp, and associated files"
+        echo "Usage: $0 {install|uninstall}"
+        echo "  install: Installs mc-router and frps with systemd services"
+        echo "  uninstall: Removes mc-router and frps along with their configurations"
         exit 1
         ;;
 esac
