@@ -1,200 +1,143 @@
 #!/bin/bash
 
-# Script to install, configure, and uninstall mc-router and frp on Ubuntu
+# Minecraft mc-router and frp installation/removal script for Ubuntu
 
-set -e
-
-# Default values
-MC_ROUTER_VERSION="latest"
+# Default variables
+MC_ROUTER_IMAGE="itzg/mc-router:latest"
 FRP_VERSION="0.60.0"
-INSTALL_DIR="/usr/local/bin"
-SERVICE_DIR="/etc/systemd/system"
-CONFIG_DIR="/etc/mc-router"
-FRP_CONFIG_DIR="/etc/frp"
-MC_ROUTER_BINARY="mc-router"
-FRP_BINARY="frps"
-MC_ROUTER_SERVICE="mc-router.service"
-FRP_SERVICE="frps.service"
+FRP_PORT="7000"
+COMPOSE_FILE="/tmp/docker-compose.yml"
+INSTALL_DIR="/opt/mc-router-frp"
+ENV_FILE="$INSTALL_DIR/.env"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m' # No Color
-
-# Function to check if running as root
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}This script must be run as root${NC}"
-        exit 1
+# Function to check if Docker is installed
+check_docker() {
+    if ! command -v docker &> /dev/null; then
+        echo "Docker not found. Installing Docker..."
+        sudo apt-get update
+        sudo apt-get install -y docker.io
+        sudo systemctl enable docker
+        sudo systemctl start docker
+        sudo usermod -aG docker $USER
+        echo "Docker installed. You may need to log out and log back in for Docker permissions to take effect."
     fi
 }
 
-# Function to install dependencies
-install_dependencies() {
-    echo "Installing dependencies..."
-    apt-get update
-    apt-get install -y curl tar docker.io
-    systemctl enable docker
-    systemctl start docker
-}
-
-# Function to download and install mc-router
-install_mc_router() {
-    echo "Installing mc-router..."
-    if [[ "$MC_ROUTER_VERSION" == "latest" ]]; then
-        # Fetch the latest release from Docker Hub (simplified, assuming binary download)
-        echo "Fetching latest mc-router version..."
-        docker pull itzg/mc-router
-    else
-        docker pull itzg/mc-router:$MC_ROUTER_VERSION
+# Function to check if Docker Compose is installed
+check_docker_compose() {
+    if ! command -v docker-compose &> /dev/null; then
+        echo "Docker Compose not found. Installing Docker Compose..."
+        sudo apt-get update
+        sudo apt-get install -y docker-compose
+        echo "Docker Compose installed."
     fi
-
-    # Ensure config directory exists
-    mkdir -p "$CONFIG_DIR"
-
-    # Create a basic routes config file
-    cat > "$CONFIG_DIR/routes.json" << EOL
-{
-  "default-server": null,
-  "mappings": {}
-}
-EOL
-
-    # Create systemd service file for mc-router
-    cat > "$SERVICE_DIR/$MC_ROUTER_SERVICE" << EOL
-[Unit]
-Description=mc-router service for Minecraft server routing
-After=network.target docker.service
-Requires=docker.service
-
-[Service]
-ExecStart=/usr/bin/docker run --rm \
-    -v $CONFIG_DIR:/config \
-    -p 25565:25565 \
-    --name mc-router \
-    itzg/mc-router \
-    --routes-config=/config/routes.json \
-    --routes-config-watch
-ExecStop=/usr/bin/docker stop mc-router
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOL
-
-    # Reload systemd and enable service
-    systemctl daemon-reload
-    systemctl enable "$MC_ROUTER_SERVICE"
-    systemctl start "$MC_ROUTER_SERVICE"
-    echo -e "${GREEN}mc-router installed and started successfully${NC}"
 }
 
-# Function to install frp
-install_frp() {
-    echo "Installing frp (frps) version $FRP_VERSION..."
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64)
-            FRP_ARCH="amd64"
-            ;;
-        aarch64)
-            FRP_ARCH="arm64"
-            ;;
-        arm*)
-            FRP_ARCH="arm"
-            ;;
-        *)
-            echo -e "${RED}Unsupported architecture: $ARCH${NC}"
-            exit 1
-            ;;
-    esac
+# Function to install mc-router and frp
+install_mc_router_frp() {
+    echo "Installing mc-router and frp..."
 
-    # Download frp
-    FRP_URL="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_${FRP_ARCH}.tar.gz"
-    curl -L "$FRP_URL" -o /tmp/frp.tar.gz
-    tar -xzf /tmp/frp.tar.gz -C /tmp
-    mv "/tmp/frp_${FRP_VERSION}_linux_${FRP_ARCH}/frps" "$INSTALL_DIR/$FRP_BINARY"
-    rm -rf "/tmp/frp_${FRP_VERSION}_linux_${FRP_ARCH}" /tmp/frp.tar.gz
+    # Create installation directory
+    sudo mkdir -p $INSTALL_DIR
 
-    # Ensure config directory exists
-    mkdir -p "$FRP_CONFIG_DIR"
+    # Create .env file
+    echo "Creating .env file at $ENV_FILE..."
+    sudo bash -c "cat > $ENV_FILE" << EOL
+MC_ROUTER_IMAGE=$MC_ROUTER_IMAGE
+FRP_VERSION=$FRP_VERSION
+FRP_PORT=$FRP_PORT
+ROUTER_MAPPING=example.com=frp:25566,sub.example.com=frp:25567
+EOL
+
+    # Create docker-compose.yml
+    echo "Creating docker-compose.yml at $COMPOSE_FILE..."
+    sudo bash -c "cat > $COMPOSE_FILE" << EOL
+version: "3.8"
+
+services:
+  frps:
+    image: snowdreamtech/frps:\${FRP_VERSION}
+    ports:
+      - "\${FRP_PORT}:\${FRP_PORT}"
+    volumes:
+      - $INSTALL_DIR/frps.ini:/etc/frp/frps.ini
+    restart: unless-stopped
+  router:
+    image: \${MC_ROUTER_IMAGE}
+    depends_on:
+      - frps
+    ports:
+      - "25565:25565"
+    environment:
+      MAPPING: \${ROUTER_MAPPING}
+    restart: unless-stopped
+EOL
 
     # Create frps.ini
-    cat > "$FRP_CONFIG_DIR/frps.ini" << EOL
+    echo "Creating frps.ini at $INSTALL_DIR/frps.ini..."
+    sudo bash -c "cat > $INSTALL_DIR/frps.ini" << EOL
 [common]
-bind_port = 7000
+bind_port = $FRP_PORT
 EOL
 
-    # Create systemd service file for frps
-    cat > "$SERVICE_DIR/$FRP_SERVICE" << EOL
-[Unit]
-Description=frp server (frps) for reverse proxy
-After=network.target
-Requires=network.target
+    # Ensure permissions
+    sudo chown -R $USER:$USER $INSTALL_DIR
+    sudo chmod 600 $ENV_FILE
+    sudo chmod 644 $INSTALL_DIR/frps.ini
+    sudo chmod 644 $COMPOSE_FILE
 
-[Service]
-ExecStart=$INSTALL_DIR/$FRP_BINARY -c $FRP_CONFIG_DIR/frps.ini
-Restart=always
+    # Start Docker Compose services
+    echo "Starting mc-router and frp services..."
+    docker-compose -f $COMPOSE_FILE up -d
 
-[Install]
-WantedBy=multi-user.target
-EOL
-
-    # Reload systemd and enable service
-    systemctl daemon-reload
-    systemctl enable "$FRP_SERVICE"
-    systemctl start "$FRP_SERVICE"
-    echo -e "${GREEN}frp (frps) installed and started successfully${NC}"
+    echo "Installation complete!"
+    echo "mc-router is exposed on port 25565."
+    echo "frps is exposed on port $FRP_PORT."
+    echo "Edit $ENV_FILE to customize ROUTER_MAPPING for your domains."
+    echo "Edit $INSTALL_DIR/frps.ini to configure frp settings."
 }
 
-# Function to uninstall mc-router
-uninstall_mc_router() {
-    echo "Uninstalling mc-router..."
-    if systemctl is-active --quiet "$MC_ROUTER_SERVICE"; then
-        systemctl stop "$MC_ROUTER_SERVICE"
+# Function to remove mc-router and frp
+remove_mc_router_frp() {
+    echo "Removing mc-router and frp..."
+
+    # Stop and remove Docker Compose services
+    if [ -f $COMPOSE_FILE ]; then
+        echo "Stopping and removing Docker Compose services..."
+        docker-compose -f $COMPOSE_FILE down
     fi
-    systemctl disable "$MC_ROUTER_SERVICE" 2>/dev/null || true
-    rm -f "$SERVICE_DIR/$MC_ROUTER_SERVICE"
-    rm -rf "$CONFIG_DIR"
-    docker rm -f mc-router 2>/dev/null || true
-    echo -e "${GREEN}mc-router uninstalled successfully${NC}"
-}
 
-# Function to uninstall frp
-uninstall_frp() {
-    echo "Uninstalling frp (frps)..."
-    if systemctl is-active --quiet "$FRP_SERVICE"; then
-        systemctl stop "$FRP_SERVICE"
+    # Remove installation directory
+    if [ -d $INSTALL_DIR ]; then
+        echo "Removing installation directory $INSTALL_DIR..."
+        sudo rm -rf $INSTALL_DIR
     fi
-    systemctl disable "$FRP_SERVICE" 2>/dev/null || true
-    rm -f "$SERVICE_DIR/$FRP_SERVICE"
-    rm -rf "$FRP_CONFIG_DIR"
-    rm -f "$INSTALL_DIR/$FRP_BINARY"
-    echo -e "${GREEN}frp (frps) uninstalled successfully${NC}"
+
+    # Remove docker-compose.yml
+    if [ -f $COMPOSE_FILE ]; then
+        echo "Removing docker-compose.yml..."
+        sudo rm -f $COMPOSE_FILE
+    fi
+
+    echo "Removal complete!"
 }
 
-# Main CLI logic
+# CLI interface
 case "$1" in
     install)
-        check_root
-        install_dependencies
-        install_mc_router
-        install_frp
-        echo -e "${GREEN}Installation complete!${NC}"
-        echo "Edit $CONFIG_DIR/routes.json for mc-router mappings."
-        echo "Edit $FRP_CONFIG_DIR/frps.ini for frp configuration."
-        echo "For local servers, download frpc from https://github.com/fatedier/frp/releases and configure frpc.ini as per the guide."
+        check_docker
+        check_docker_compose
+        install_mc_router_frp
         ;;
-    uninstall)
-        check_root
-        uninstall_mc_router
-        uninstall_frp
-        echo -e "${GREEN}Uninstallation complete!${NC}"
+    remove)
+        remove_mc_router_frp
         ;;
     *)
-        echo "Usage: $0 {install|uninstall}"
-        echo "  install: Installs mc-router and frps with systemd services"
-        echo "  uninstall: Removes mc-router and frps along with their configurations"
+        echo "Usage: $0 {install|remove}"
+        echo "  install: Install mc-router and frp with Docker Compose"
+        echo "  remove: Remove mc-router, frp, and associated files"
         exit 1
         ;;
 esac
+
+exit 0
